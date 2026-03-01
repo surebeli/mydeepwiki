@@ -193,6 +193,16 @@
           "top_p": 0.8
         }
       }
+    },
+    "kimi-coding": {
+      "default_model": "k2p5",
+      "supportsCustomModel": true,
+      "models": {
+        "k2p5": {
+          "temperature": 0.7,
+          "top_p": 0.8
+        }
+      }
     }
   }
 }

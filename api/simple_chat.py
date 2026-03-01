@@ -18,6 +18,7 @@ from api.openrouter_client import OpenRouterClient
 from api.bedrock_client import BedrockClient
 from api.azureai_client import AzureAIClient
 from api.dashscope_client import DashscopeClient
+from api.kimi_client import KimiCodingClient
 from api.rag import RAG
 from api.prompts import (
     DEEP_RESEARCH_FIRST_ITERATION_PROMPT,
@@ -64,7 +65,7 @@ class ChatCompletionRequest(BaseModel):
     type: Optional[str] = Field("github", description="Type of repository (e.g., 'github', 'gitlab', 'bitbucket')")
 
     # model parameters
-    provider: str = Field("google", description="Model provider (google, openai, openrouter, ollama, bedrock, azure, dashscope)")
+    provider: str = Field("google", description="Model provider (google, openai, openrouter, ollama, bedrock, azure, dashscope, kimi-coding)")
     model: Optional[str] = Field(None, description="Model name for the specified provider")
 
     language: Optional[str] = Field("en", description="Language for content generation (e.g., 'en', 'ja', 'zh', 'es', 'kr', 'vi')")
@@ -449,6 +450,23 @@ async def chat_completions_stream(request: ChatCompletionRequest):
                 model_kwargs=model_kwargs,
                 model_type=ModelType.LLM,
             )
+        elif request.provider == "kimi-coding":
+            logger.info(f"Using Kimi Coding with model: {request.model}")
+
+            model = KimiCodingClient()
+            model_kwargs = {
+                "model": request.model,
+                "stream": True,
+                "temperature": model_config["temperature"],
+            }
+            if "top_p" in model_config:
+                model_kwargs["top_p"] = model_config["top_p"]
+
+            api_kwargs = model.convert_inputs_to_api_kwargs(
+                input=prompt,
+                model_kwargs=model_kwargs,
+                model_type=ModelType.LLM,
+            )
         else:
             # Initialize Google Generative AI model (default provider)
             model = genai.GenerativeModel(
@@ -548,6 +566,27 @@ async def chat_completions_stream(request: ChatCompletionRequest):
                             f"\nError with Dashscope API: {str(e_dashscope)}\n\n"
                             "Please check that you have set the DASHSCOPE_API_KEY (and optionally "
                             "DASHSCOPE_WORKSPACE_ID) environment variables with valid values."
+                        )
+                elif request.provider == "kimi-coding":
+                    try:
+                        logger.info("Making Kimi Coding API call")
+                        response = await model.acall(api_kwargs=api_kwargs, model_type=ModelType.LLM)
+                        # KimiCodingClient extends OpenAIClient: acall with stream=True
+                        # returns an async generator of ChatCompletionChunk
+                        async for chunk in response:
+                            choices = getattr(chunk, "choices", [])
+                            if len(choices) > 0:
+                                delta = getattr(choices[0], "delta", None)
+                                if delta is not None:
+                                    text = getattr(delta, "content", None)
+                                    if text is not None:
+                                        yield text
+                    except Exception as e_kimi:
+                        logger.error(f"Error with Kimi Coding API: {str(e_kimi)}")
+                        yield (
+                            f"\nError with Kimi Coding API: {str(e_kimi)}\n\n"
+                            "Please check that you have set the KIMI_API_KEY "
+                            "environment variable with a valid API key."
                         )
                 else:
                     # Google Generative AI (default provider)
@@ -744,6 +783,73 @@ async def chat_completions_stream(request: ChatCompletionRequest):
         error_msg = f"Error in streaming chat completion: {str(e_handler)}"
         logger.error(error_msg)
         raise HTTPException(status_code=500, detail=error_msg)
+
+@app.post("/chat/retrieve_context")
+async def retrieve_context(request: ChatCompletionRequest):
+    """Retrieve RAG context without LLM generation.
+
+    This endpoint performs only the document retrieval step of the RAG pipeline,
+    returning the retrieved code context as plain text. Used by MCP sampling
+    to delegate LLM generation to the host client.
+    """
+    try:
+        # Create RAG instance (provider/model don't matter for retrieval only)
+        request_rag = RAG(provider=request.provider or "ollama", model=request.model or "qwen3:8b")
+
+        # Parse exclusion/inclusion filters
+        excluded_dirs = None
+        excluded_files = None
+        included_dirs = None
+        included_files = None
+        if request.excluded_dirs:
+            excluded_dirs = [d.strip() for d in request.excluded_dirs.split('\n') if d.strip()]
+        if request.excluded_files:
+            excluded_files = [f.strip() for f in request.excluded_files.split('\n') if f.strip()]
+        if request.included_dirs:
+            included_dirs = [unquote(d.strip()) for d in request.included_dirs.split('\n') if d.strip()]
+        if request.included_files:
+            included_files = [unquote(f.strip()) for f in request.included_files.split('\n') if f.strip()]
+
+        request_rag.prepare_retriever(
+            request.repo_url, request.type, request.token,
+            excluded_dirs, excluded_files, included_dirs, included_files
+        )
+
+        # Get query from last message
+        if not request.messages or len(request.messages) == 0:
+            raise HTTPException(status_code=400, detail="No messages provided")
+        query = request.messages[-1].content
+
+        # Perform RAG retrieval only
+        context_text = ""
+        try:
+            retrieved_documents = request_rag(query, language=request.language)
+            if retrieved_documents and retrieved_documents[0].documents:
+                documents = retrieved_documents[0].documents
+                docs_by_file = {}
+                for doc in documents:
+                    file_path = doc.meta_data.get('file_path', 'unknown')
+                    if file_path not in docs_by_file:
+                        docs_by_file[file_path] = []
+                    docs_by_file[file_path].append(doc)
+
+                context_parts = []
+                for file_path, docs in docs_by_file.items():
+                    header = f"## File Path: {file_path}\n\n"
+                    content = "\n\n".join([doc.text for doc in docs])
+                    context_parts.append(f"{header}{content}")
+
+                context_text = "\n\n" + "-" * 10 + "\n\n".join(context_parts)
+        except Exception as e:
+            logger.error(f"Error in RAG retrieval: {str(e)}")
+
+        return {"context": context_text}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving context: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving context: {str(e)}")
 
 @app.get("/")
 async def root():
